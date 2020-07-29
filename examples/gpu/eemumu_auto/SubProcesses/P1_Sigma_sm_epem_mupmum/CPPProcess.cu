@@ -832,12 +832,12 @@ __global__ void sigmaKin(double * allmomenta, double * output)
   double matrix_element[nprocesses]; 
 
   thrust::complex<double> amp[2]; 
-
+/*
   // NOTE: Assume 2 half-warps
   // That's shared across the whole block
   // This assumes we are running 256 threads per block, i.e. 16 half-warps
   // Shared memory will have to be allocated dynamically if other values are used
-  __shared__ double shared_m[16][4][3];
+  __shared__ double shared_m[32][4][3];
 
   //double local_m[4][3]; 
   // This is the memory dimension - 16 times less than there are threads
@@ -862,7 +862,28 @@ __global__ void sigmaKin(double * allmomenta, double * output)
     }
 
   __syncwarp();
+*/
+  // Use 512 threads per block to efficiently access global memory
+  __shared__ double shared_m[32][4][3];
+  int DIM = blockDim.x * gridDim.x / 16; 
+  
+  // 32 * 4 * 3 = 384, so the last 4 warps will not participate - can they be used for something else?
+  // Let's see whether register count explodes with index calculations
+  if (threadIdx.x < 384) {
+    // This division cannot be optimised out
+    // 0, 1, 2, 3
+    int outer_skip = threadIdx.x / 96;
+    // That module cannot be optimised out
+    // 0, 1, 2
+    int inner_skip = (threadIdx.x % 96) / 32;
+    shared_m[warp_lane][outer_skip][inner_skip] = allmomenta[outer_skip * 3 * DIM + inner_skip * DIM + blockIdx.x * 32 + warp_lane]; 
+  }
+  // Threads now access 'random' global and shared memory - need to wait for the whole block to finish
+  __syncthreads();
 
+  /*if (warp_lane == 0) {
+	  printf("%f", shared_m[half_warp_id][3][1]); 
+  }*/
   //const int ncomb = 16; 
   const int denominators[1] = {4}; 
 
