@@ -689,17 +689,17 @@ __constant__ double cIPD[2];
 
 // Evaluate |M|^2 for each subprocess
 
-__device__ void calculate_wavefunctions(int ihel, double local_mom[4][3],
-    double &matrix)
+__device__ double calculate_wavefunctions(int ihel, double local_mom[4][3])
 {
   using namespace MG5_sm; 
   thrust::complex<double> amp[2]; 
   // Calculate wavefunctions for all processes
-  thrust::complex<double> w[5][6]; 
-  oxxxxx(local_mom[0], 0., cHel[ihel][0], -1, w[0]); 
-  ixxxxx(local_mom[1], 0., cHel[ihel][1], +1, w[1]); 
-  ixxxxx(local_mom[2], 0., cHel[ihel][2], -1, w[2]); 
-  oxxxxx(local_mom[3], 0., cHel[ihel][3], +1, w[3]); 
+  thrust::complex<double> w[5][6];
+  // NOTE: Might be useful to precompute
+  oxxxxx(local_mom[0], 0., cHel[ihel][0], -1, w[0]);
+  ixxxxx(local_mom[1], 0., cHel[ihel][1], +1, w[1]);
+  ixxxxx(local_mom[2], 0., cHel[ihel][2], -1, w[2]);
+  oxxxxx(local_mom[3], 0., cHel[ihel][3], +1, w[3]);
   FFV1P0_3(w[1], w[0], thrust::complex<double> (cIPC[0], cIPC[1]), 0., 0.,
       w[4]);
   // Amplitude(s) for diagram number 1
@@ -726,17 +726,22 @@ __device__ void calculate_wavefunctions(int ihel, double local_mom[4][3],
   jamp[0] = -amp[0] - amp[1]; 
 
   // Sum and square the color flows to get the matrix element
+  
+  double matrix_tmp = 0.0;
+  
   for(i = 0; i < ncolor; i++ )
   {
     ztemp = 0.; 
     for(j = 0; j < ncolor; j++ )
       ztemp = ztemp + cf[i][j] * jamp[j]; 
-    matrix = matrix + (ztemp * conj(jamp[i])).real()/denom[i]; 
+    matrix_tmp = matrix_tmp + (ztemp * conj(jamp[i])).real()/denom[i]; 
   }
 
   // Store the leading color flows for choice of color
   // for(i=0;i < ncolor; i++)
   // jamp2[0][i] += real(jamp[i]*conj(jamp[i]));
+
+  return matrix_tmp;
 
 }
 
@@ -807,8 +812,17 @@ __global__ void sigmaKin(double * allmomenta, double * output)
   // Reset color flows
 
   // for (int xx = 0; xx < 384; ++xx) {
-  const int nprocesses = 1; 
-  int tid = blockIdx.x * blockDim.x + threadIdx.x; 
+  const int nprocesses = 1;
+  // Get half-warp ID within the entire thread grid
+  int half_warp_grid_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 4;
+  // Lane within the warp
+  int warp_lane = threadIdx.x & 31;
+  // Which half in the warp it is. Can be either 0 or 1
+  int half_warp_id = warp_lane >> 4;
+  // Lane withing the half warp
+  int half_lane = warp_lane & 15;
+
+  int warp = threadIdx.x >> 5;
 
   // char *devPtr = (char *)tp.ptr;
   // size_t dpt = tp.pitch;
@@ -819,71 +833,69 @@ __global__ void sigmaKin(double * allmomenta, double * output)
 
   thrust::complex<double> amp[2]; 
 
-  double local_m[4][3]; 
-  int DIM = blockDim.x * gridDim.x; 
+  // NOTE: Assume 2 half-warps
+  // That's shared across the whole block
+  // This assumes we are running 256 threads per block, i.e. 16 half-warps
+  // Shared memory will have to be allocated dynamically if other values are used
+  __shared__ double shared_m[16][4][3];
+
+  //double local_m[4][3]; 
+  // This is the memory dimension - 16 times less than there are threads
+  int DIM = blockDim.x * gridDim.x / 16; 
   // for (int i=0; i<20;i++){
   // printf(" %f ", allmomenta[i]);
   // }
   // printf("\n");
   // printf("DIM is %i/%i\n", tid, DIM);
-  for (int i = 0; i < 4; i++ )
-  {
-    for (int j = 0; j < 3; j++ )
+  
+  int outer_skip = 0;
+  // Only threads at the stard of the half warp load the data
+  if ( half_lane == 0 ) {
+    for (int i = 0; i < 4; i++ )
     {
-      local_m[i][j] = allmomenta[i * 3 * DIM + j * DIM + tid]; 
-      // printf(" %f ", local_m[i][j]);
+      for (int j = 0; j < 3; j++ )
+      {
+        shared_m[warp * 2 + half_warp_id][i][j] = allmomenta[outer_skip + j * DIM + half_warp_grid_id];
+      }
+      outer_skip += 3 * DIM;
     }
-    // printf("\n");
-  }
+    }
 
+  __syncwarp();
 
-  // Local variables and constants
-  const int ncomb = 16; 
-  // static bool goodhel[ncomb] = {ncomb * false};
-  // static int ntry = 0, sum_hel = 0, ngood = 0;
-  // static int igood[ncomb];
-  // static int jhel;
-  // std::complex<double> **wfs;
-  // double t[1];
-  // Helicities for the process
-  // static const int helicities[ncomb][nexternal] =
-  // {{-1,-1,-1,-1},{-1,-1,-1,1},{-1,-1,1,-1},{-1,-1,1,1},{-1,1,-1,-1},{-1,1,-1,
-  // 1},{-1,1,1,-1},{-1,1,1,1},{1,-1,-1,-1},{1,-1,-1,1},{1,-1,1,-1},{1,-1,1,1},{
-  // 1,1,-1,-1},{1,1,-1,1},{1,1,1,-1},{1,1,1,1}};
-  // Denominators: spins, colors and identical particles
+  //const int ncomb = 16; 
   const int denominators[1] = {4}; 
 
+  double matrix_el_sum = 0.0;
 
-  // Reset the matrix elements
-  for(int i = 0; i < nprocesses; i++ )
-  {
-    matrix_element[i] = 0.; 
-  }
-  // Define permutation
-  // int perm[nexternal];
-  // for(int i = 0; i < nexternal; i++){
-  // perm[i]=i;
-  // }
+  matrix_el_sum = calculate_wavefunctions(half_lane, shared_m[warp * 2 + half_warp_id]);
 
-
-  for (int ihel = 0; ihel < ncomb; ihel++ )
-  {
-    calculate_wavefunctions(ihel, local_m, matrix_element[0]); 
+  // That sums 16 results - not generalised yet
+  for (int offset = 1; offset < 16; offset *=2) {
+    matrix_el_sum += __shfl_down_sync(0xFFFFFF, matrix_el_sum, offset);
   }
 
+  __syncwarp();
 
-  for (int i = 0; i < nprocesses; ++ i)
+  // NOTE: Only 2 lanes participating at the end
+  if ( (half_lane == 0) ) {
+    matrix_el_sum /= denominators[0];
+    output[half_warp_grid_id] = matrix_el_sum;
+  }
+
+/*  for (int i = 0; i < nprocesses; ++ i)
   {
     matrix_element[i] /= denominators[i]; 
   }
-  for (int i = 0; i < nprocesses; ++ i)
+*/
+/*  for (int i = 0; i < nprocesses; ++ i)
   {
     output[i * nprocesses + tid] = matrix_element[i]; 
     // printf("output %i %i %i %f", tid, i, i*nprocesses+tid,
     // output[i*nprocesses+tid]);
 
   }
-
+*/
 
 }
 
@@ -891,5 +903,6 @@ __global__ void sigmaKin(double * allmomenta, double * output)
 // Private class member functions
 
 //--------------------------------------------------------------------------
+
 
 

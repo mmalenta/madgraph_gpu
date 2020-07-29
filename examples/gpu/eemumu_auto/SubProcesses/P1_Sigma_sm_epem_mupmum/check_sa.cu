@@ -81,6 +81,7 @@ int main(int argc, char **argv) {
 
   int dim = gpublocks * gputhreads;
 
+
   // Local Memory
   //typedef double arr_t[4][4];
   double* lp = new double[4*3*dim];
@@ -120,6 +121,7 @@ int main(int argc, char **argv) {
       timer.Start();
     }
 
+    gpublocks *= 16;
     // Evaluate matrix element
     // later process.sigmaKin(ncomb, goodhel, ntry, sum_hel, ngood, igood,
     // jhel);
